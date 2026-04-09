@@ -638,10 +638,11 @@ class GatewayRunner:
         self,
         old_session_id: str,
     ):
-        """Prompt the agent to save memories/skills before context is lost.
+        """Schedule memory/skill drafting for later — reduces inference load.
 
-        Synchronous worker — meant to be called via run_in_executor from
-        an async context so it doesn't block the event loop.
+        Instead of immediately running an agent to review the transcript, we schedule
+        a cron job that runs 30 minutes later. This reduces inference load during
+        the user's active session and allows immediate session cleanup.
         """
         # Skip cron sessions — they run headless with no meaningful user
         # conversation to extract memories from.
@@ -654,39 +655,7 @@ class GatewayRunner:
             if not history or len(history) < 4:
                 return
 
-            from run_agent import AIAgent
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
-            if not runtime_kwargs.get("api_key"):
-                return
-
-            # Resolve model from config — AIAgent's default is OpenRouter-
-            # formatted ("anthropic/claude-opus-4.6") which fails when the
-            # active provider is openai-codex.
-            model = _resolve_gateway_model()
-
-            tmp_agent = AIAgent(
-                **runtime_kwargs,
-                model=model,
-                max_iterations=8,
-                quiet_mode=True,
-                skip_memory=True,  # Flush agent — no memory provider
-                enabled_toolsets=["memory", "skills"],
-                session_id=old_session_id,
-            )
-            # Fully silence the flush agent — quiet_mode only suppresses init
-            # messages; tool call output still leaks to the terminal through
-            # _safe_print → _print_fn.  Set a no-op to prevent that.
-            tmp_agent._print_fn = lambda *a, **kw: None
-
-            # Build conversation history from transcript
-            msgs = [
-                {"role": m.get("role"), "content": m.get("content")}
-                for m in history
-                if m.get("role") in ("user", "assistant") and m.get("content")
-            ]
-
-            # Read live memory state from disk so the flush agent can see
-            # what's already saved and avoid overwriting newer entries.
+            # Load existing memory state to include in the scheduled job's context
             _current_memory = ""
             try:
                 from tools.memory_tool import get_memory_dir
@@ -701,44 +670,49 @@ class GatewayRunner:
                         if content:
                             _current_memory += f"\n\n## Current {label}:\n{content}"
             except Exception:
-                pass  # Non-fatal — flush still works, just without the guard
+                pass  # Non-fatal — job still works, just without the guard
 
-            # Give the agent a real turn to think about what to save
-            flush_prompt = (
-                "[System: This session is about to be automatically reset due to "
-                "inactivity or a scheduled daily reset. The conversation context "
-                "will be cleared after this turn.\n\n"
-                "Review the conversation above and:\n"
-                "1. Save any important facts, preferences, or decisions to memory "
-                "(user profile or your notes) that would be useful in future sessions.\n"
-                "2. If you discovered a reusable workflow or solved a non-trivial "
-                "problem, consider saving it as a skill.\n"
-                "3. If nothing is worth saving, that's fine — just skip.\n\n"
+            # Schedule a cron job to review the transcript and draft skills/memories
+            from cron import create_job
+            
+            scheduled_prompt = (
+                f"Review the session transcript for session_id: {old_session_id}\n\n"
+                "Determine if anything should be saved to memory or as a skill.\n\n"
+                "FOR SKILLS:\n"
+                "- Load the 'skill-saver' skill first for format guidance\n"
+                "- Skills MUST have YAML frontmatter starting with '---'\n"
+                "- Category must be a SINGLE directory name (no slashes!)\n"
+                "- Include: trigger conditions, numbered steps, pitfalls, verification\n\n"
+                "FOR MEMORIES:\n"
+                "Only add new information — do NOT overwrite or remove existing entries "
+                "unless the conversation reveals something that genuinely supersedes them.\n\n"
+                "Current memory state (for reference, do not overwrite):\n"
             )
-
+            
             if _current_memory:
-                flush_prompt += (
-                    "IMPORTANT — here is the current live state of memory. Other "
-                    "sessions, cron jobs, or the user may have updated it since this "
-                    "conversation ended. Do NOT overwrite or remove entries unless "
-                    "the conversation above reveals something that genuinely "
-                    "supersedes them. Only add new information that is not already "
-                    "captured below."
-                    f"{_current_memory}\n\n"
-                )
-
-            flush_prompt += (
-                "Do NOT respond to the user. Just use the memory and skill_manage "
-                "tools if needed, then stop.]"
+                scheduled_prompt += _current_memory
+            else:
+                scheduled_prompt += "(No existing memory found)\n"
+            
+            scheduled_prompt += (
+                "\n\nIf you find something worth saving, use the appropriate tool (memory or skill_manage). "
+                "If nothing is worth saving, just skip."
             )
 
-            tmp_agent.run_conversation(
-                user_message=flush_prompt,
-                conversation_history=msgs,
+            # Create a one-shot cron job to run 30 minutes after session ends
+            create_job(
+                schedule="30m",
+                prompt=scheduled_prompt,
+                skill="skill-saver",  # Load skill-saver for formatting guidance
+                deliver="origin",
+                name=f"Skill/Memory draft: {old_session_id[:12]}",
+                repeat=1  # Run once only
             )
-            logger.info("Pre-reset memory flush completed for session %s", old_session_id)
+            logger.info("Scheduled skill/memory drafting for session %s (runs in 30m)", old_session_id)
+            
         except Exception as e:
-            logger.debug("Pre-reset memory flush failed for session %s: %s", old_session_id, e)
+            logger.warning("Failed to schedule skill drafting for %s: %s", old_session_id, e)
+
 
     async def _async_flush_memories(
         self,
